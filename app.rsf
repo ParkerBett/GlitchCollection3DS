@@ -1,0 +1,92 @@
+
+BasicInfo:
+  Title          : "Glitch Collection"
+  ProductCode    : "CTR-P-GLCH"
+  Logo           : Licensed
+
+TitleInfo:
+  Category       : Application
+  UniqueId       : 0xF61C0
+
+Option:
+  UseOnSD        : true
+  FreeProductCode: true
+  MediaFootPadding: false
+  EnableCrypt    : false
+  EnableCompress : true
+
+AccessControlInfo:
+  CoreVersion    : 2
+  DescVersion    : 2
+  ReleaseKernelMajor: "02"
+  ReleaseKernelMinor: "33"
+
+  FileSystemAccess:
+    - DirectSdmc
+
+  MemoryType     : Application
+  SystemMode     : 64MB
+  IdealProcessor : 0
+  AffinityMask   : 1
+  Priority       : 16
+  MaxCpu         : 0x9E
+  HandleTableSize: 0x200
+
+  SystemModeExt  : Legacy
+  CpuSpeed       : 268MHz
+  EnableL2Cache  : false
+
+  IORegisterMapping:
+    - 1ff00000-1ff7ffff
+
+  MemoryMapping:
+    - 1f000000-1f5fffff:r
+
+  SystemCallAccess:
+    ControlMemory: 1
+    QueryMemory: 2
+    ExitProcess: 3
+    CreateThread: 8
+    ExitThread: 9
+    SleepThread: 10
+    GetThreadPriority: 11
+    SetThreadPriority: 12
+    CreateMutex: 19
+    ReleaseMutex: 20
+    CreateSemaphore: 21
+    ReleaseSemaphore: 22
+    CreateEvent: 23
+    SignalEvent: 24
+    ClearEvent: 25
+    CreateTimer: 26
+    SetTimer: 27
+    CancelTimer: 28
+    ClearTimer: 29
+    CreateMemoryBlock: 30
+    MapMemoryBlock: 31
+    UnmapMemoryBlock: 32
+    CloseHandle: 35
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+    GetSystemTick: 40
+    ConnectToPort: 45
+    SendSyncRequest: 50
+    GetSystemInfo: 42
+    GetProcessInfo: 43
+    GetThreadInfo: 44
+
+  ServiceAccessControl:
+    - APT:U
+    - dsp::DSP
+    - fs:USER
+    - gsp::Gpu
+    - hid:USER
+
+SystemControlInfo:
+  SaveDataSize: 0KB
+  RemasterVersion: 0
+  StackSize: 0x40000
+  Dependency:
+    dsp: 0x0004013000001a02
+    gsp: 0x0004013000001c02
+

@@ -38,10 +38,14 @@ DATA		:=	data
 INCLUDES    :=  include library/include
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
-#ROMFS		:=	romfs
+ROMFS := romfs
+
 #GFXBUILD	:=	$(ROMFS)/gfx
 
-APP_TITLE   :=  Glitch Collection
+APP_TITLE       := Glitch Collection
+APP_DESCRIPTION := A Collection of Glitch Shows
+APP_AUTHOR      := ParkerBett
+ICON            := icon.png
 
 #---------------------------------------------------------------------------------
 # options for code generation

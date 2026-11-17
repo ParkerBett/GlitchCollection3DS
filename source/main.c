@@ -1,9 +1,9 @@
 // Glitch Collection - native 3DS app: show/episode menu + FFmpeg video & audio player
 //
-// SD card layout (made by prepare_sd.ps1):
-//   sdmc:/GlitchCollection/<folder>/main.jpg   show cover   (512x256 JPEG)
-//   sdmc:/GlitchCollection/<folder>/<n>.jpg    episode image (512x256 JPEG)
-//   sdmc:/GlitchCollection/<folder>/<n>.ogv    episode video (Theora + Vorbis)
+// Embedded RomFS layout:
+//   romfs:/GlitchCollection/<folder>/main.jpg   show cover   (512x256 JPEG)
+//   romfs:/GlitchCollection/<folder>/<n>.jpg    episode image (512x256 JPEG)
+//   romfs:/GlitchCollection/<folder>/<n>.ogv    episode video (Theora + Vorbis)
 //
 // Menu:    D-Pad / Circle Pad = move, A = select, B = back, tap a row to select.
 // Playing: A (or tap) = pause/resume, B = stop and go back.
@@ -30,9 +30,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
+#include <sys/types.h>
 
-#define ROOT "sdmc:/GlitchCollection"
+#define ROOT "romfs:/GlitchCollection"
 #define TOP_W 400.0f
 #define BOT_W 320.0f
 
@@ -68,11 +68,52 @@ static void draw_wrapped(const char* s, float x, float y, float scale, u32 color
     C2D_DrawText(&t, C2D_WithColor | C2D_WordWrap, x, y, 0.5f, scale, scale, color, width);
 }
 
-static bool file_size(const char* path, long* size) {
-    struct stat st;
-    if (stat(path, &st) != 0) return false;
-    *size = (long)st.st_size;
-    return true;
+/* Read video data from an embedded RomFS file for FFmpeg. */
+static int romfs_read(void* opaque, uint8_t* buffer, int bufferSize) {
+    FILE* file = (FILE*)opaque;
+    size_t bytes = fread(buffer, 1, (size_t)bufferSize, file);
+
+    if (bytes == 0) {
+        if (feof(file))
+            return AVERROR_EOF;
+        return AVERROR(errno ? errno : EIO);
+    }
+
+    return (int)bytes;
+}
+
+/* Handle FFmpeg seek requests, including requests for the file size. */
+static int64_t romfs_seek(void* opaque, int64_t offset, int whence) {
+    FILE* file = (FILE*)opaque;
+
+    if (whence == AVSEEK_SIZE) {
+        off_t current = ftello(file);
+        if (current < 0)
+            return AVERROR(errno ? errno : EIO);
+
+        if (fseeko(file, 0, SEEK_END) != 0)
+            return AVERROR(errno ? errno : EIO);
+
+        off_t size = ftello(file);
+        if (size < 0)
+            return AVERROR(errno ? errno : EIO);
+
+        if (fseeko(file, current, SEEK_SET) != 0)
+            return AVERROR(errno ? errno : EIO);
+
+        return (int64_t)size;
+    }
+
+    whence &= ~AVSEEK_FORCE;
+
+    if (fseeko(file, (off_t)offset, whence) != 0)
+        return AVERROR(errno ? errno : EIO);
+
+    off_t position = ftello(file);
+    if (position < 0)
+        return AVERROR(errno ? errno : EIO);
+
+    return (int64_t)position;
 }
 
 /* ================================================================== covers
@@ -582,6 +623,24 @@ static void audio_pump(void) {
     }
 }
 
+/* Throw away all queued/decoded audio (used when seeking). */
+static void audio_seek_reset(void) {
+    if (g_audioStream < 0)
+        return;
+
+    if (g_dspReady)
+        ndspChnWaveBufClear(AUDIO_CHANNEL);
+
+    if (g_adec)
+        avcodec_flush_buffers(g_adec);
+
+    g_fifoRead = g_fifoCount = 0;
+    g_nextWb = 0;
+    g_audioStarted = 0;
+    g_inUnderrun = 0;
+    memset(g_wb, 0, sizeof(g_wb));
+}
+
 /* ================================================================== read-ahead
    Video packets are queued so the file can be read AHEAD of the video decoder.
    That lets audio stay decoded well in advance and survive slow video frames. */
@@ -655,6 +714,8 @@ typedef struct {
     int failed;                 /* open or decode failed: show message */
     char message[200];
     AVFormatContext* format;
+    FILE* romfsFile;
+    AVIOContext* io;
     AVCodecContext* decoder;
     AVPacket* packet;
     AVFrame* frame;
@@ -694,7 +755,18 @@ static void player_release(void) {
     demux_reset();
     audio_close();
 
-    if (P.format) avformat_close_input(&P.format);
+    if (P.format)
+        avformat_close_input(&P.format);
+
+    if (P.io) {
+        av_freep(&P.io->buffer);
+        avio_context_free(&P.io);
+    }
+
+    if (P.romfsFile) {
+        fclose(P.romfsFile);
+        P.romfsFile = NULL;
+    }
 
     P.active = 0;
 }
@@ -715,6 +787,9 @@ static int player_fail(const char* msg) {
     return 0;
 }
 
+/* After a seek the decoder may reject a few packets until the next keyframe; ignore them. */
+static int seekGrace = 0;
+
 /* Return 1 for a decoded frame, 2 for "repeat the previous frame",
    0 at end of file, or -1 on error. */
 static int decode_next_frame(void) {
@@ -728,6 +803,7 @@ static int decode_next_frame(void) {
             return 0;
 
         if (result != AVERROR(EAGAIN)) {
+            if (seekGrace > 0) { seekGrace--; continue; }
             decodeErrorCode = result;
             snprintf(decodeInfo, sizeof(decodeInfo), "failed in: receive_frame");
             return -1;
@@ -777,6 +853,7 @@ static int decode_next_frame(void) {
         av_packet_unref(P.packet);
 
         if (result < 0 && result != AVERROR(EAGAIN)) {
+            if (seekGrace > 0) { seekGrace--; continue; }
             decodeErrorCode = result;
             snprintf(decodeInfo, sizeof(decodeInfo),
                      "send_packet: size=%d codec=%s threads=%d",
@@ -788,7 +865,7 @@ static int decode_next_frame(void) {
     }
 }
 
-/* path is a plain sdmc: path; returns 1 on success. On failure P.failed + P.message are set. */
+/* path is an embedded RomFS path; returns 1 on success. On failure P.failed + P.message are set. */
 static int player_open(const char* path) {
     memset(&P, 0, sizeof(P));
     P.videoStream = -1;
@@ -796,19 +873,44 @@ static int player_open(const char* path) {
     lastLog[0] = 0;
     decodeInfo[0] = 0;
     decodeErrorCode = 0;
+    seekGrace = 0;
     tDecode = tConvert = tSwizzle = tUpload = tAudio = 0;
     timedFrames = droppedFrames = 0;
     demux_reset();
 
-    long size = 0;
-    if (!file_size(path, &size))
-        return player_fail("video file not found on SD card");
+    P.romfsFile = fopen(path, "rb");
+    if (!P.romfsFile)
+        return player_fail("could not open embedded video");
 
-    char url[300];
-    snprintf(url, sizeof(url), "file:%s", path);   /* "file:" is required by FFmpeg */
+    const int ioBufferSize = 32 * 1024;
+    uint8_t* ioBuffer = (uint8_t*)av_malloc(ioBufferSize);
+    if (!ioBuffer)
+        return player_fail("could not allocate video buffer");
 
-    if (avformat_open_input(&P.format, url, NULL, NULL) < 0)
-        return player_fail("could not open video");
+    P.io = avio_alloc_context(
+        ioBuffer,
+        ioBufferSize,
+        0,
+        P.romfsFile,
+        romfs_read,
+        NULL,
+        romfs_seek
+    );
+
+    if (!P.io) {
+        av_free(ioBuffer);
+        return player_fail("could not create video reader");
+    }
+
+    P.format = avformat_alloc_context();
+    if (!P.format)
+        return player_fail("could not allocate video context");
+
+    P.format->pb = P.io;
+    P.format->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+    if (avformat_open_input(&P.format, NULL, NULL, NULL) < 0)
+        return player_fail("could not open embedded video");
 
     if (avformat_find_stream_info(P.format, NULL) < 0)
         return player_fail("could not read stream info");
@@ -898,6 +1000,55 @@ static void player_toggle_pause(void) {
         if (g_dspReady && g_audioStream >= 0)
             ndspChnSetPaused(AUDIO_CHANNEL, false);
     }
+}
+
+static unsigned player_elapsed_s(void);
+static unsigned player_total_s(void);
+
+/* Jump to (about) sec seconds. Lands on the keyframe at or before that point, then the
+   clock is set to where we really landed so picture and sound stay together. */
+static void player_seek_to(double sec) {
+    if (!P.active || P.eof || P.failed)
+        return;
+
+    unsigned total = player_total_s();
+    if (total > 0 && sec > (double)total - 2.0)
+        sec = (double)total - 2.0;
+    if (sec < 0.0)
+        sec = 0.0;
+
+    if (av_seek_frame(P.format, -1, (int64_t)(sec * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD) < 0)
+        return;   /* seek not possible: keep playing as before */
+
+    demux_reset();
+    audio_seek_reset();
+    avcodec_flush_buffers(P.decoder);
+    av_frame_unref(P.frame);
+    P.inputEnded = 0;
+    P.flushSent = 0;
+    seekGrace = 30;
+
+    if (P.paused) {   /* seeking resumes playback so the new picture appears */
+        P.paused = 0;
+        if (g_dspReady && g_audioStream >= 0)
+            ndspChnSetPaused(AUDIO_CHANNEL, false);
+    }
+
+    while (!demuxEnded && vqCount < VQ_CAP - 1 &&
+           (g_audioStream >= 0 ? g_fifoCount < PREROLL_FRAMES : vqCount < 8))
+        demux_one(P.format, P.packet, P.videoStream);
+
+    audio_pump();
+
+    double landing = sec;
+    if (vqCount > 0 && vq[vqHead]->pts != AV_NOPTS_VALUE) {
+        double t = (double)vq[vqHead]->pts * av_q2d(P.format->streams[P.videoStream]->time_base);
+        if (t >= 0.0 && t <= sec + 1.0 && t >= sec - 15.0)
+            landing = t;
+    }
+
+    P.frames = (int)(landing * VIDEO_FPS + 0.5);
+    P.startMs = osGetTime() - (u64)(landing * 1000.0);
 }
 
 static unsigned player_elapsed_s(void) {
@@ -1016,6 +1167,7 @@ static int player_update(void) {
 /* ================================================================== main */
 int main(void) {
     gfxInitDefault();
+    romfsInit();
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
     C2D_Prepare();
@@ -1056,8 +1208,19 @@ int main(void) {
                 touchPosition tp;
                 hidTouchRead(&tp);
 
-                player_toggle_pause();
+                /* touching the progress bar jumps there; anywhere else pauses */
+                if (P.active && tp.py >= 96 && tp.py <= 134 && player_total_s() > 0) {
+                    float f = ((float)tp.px - 12.0f) / 296.0f;
+                    if (f < 0.0f) f = 0.0f;
+                    if (f > 1.0f) f = 1.0f;
+                    player_seek_to(f * (float)player_total_s());
+                } else {
+                    player_toggle_pause();
+                }
             }
+
+            if (kDown & KEY_DLEFT)  player_seek_to((double)player_elapsed_s() - 10.0);
+            if (kDown & KEY_DRIGHT) player_seek_to((double)player_elapsed_s() + 10.0);
 
             if (!stop && player_update())
                 stop = true;   /* finished: back to the episode list (no auto-next) */
@@ -1205,7 +1368,7 @@ int main(void) {
             if (!P.failed && !g_dspReady)
                 draw_wrapped(g_audioStatus, 12, 150, 0.35f, cGrey, 296.0f);
 
-            draw_text("A: pause   B: stop   START: exit", 8, 222, 0.4f, cGrey);
+            draw_text("A: pause   Pad L/R: seek 10s   B: stop", 8, 222, 0.4f, cGrey);
         } else {
             if (state == ST_SHOWS) draw_text("Choose a show", 8, 2, 0.6f, cWhite);
             else draw_text(SHOWS[showIdx].name, 8, 2, 0.55f, cWhite);
@@ -1229,6 +1392,7 @@ int main(void) {
     player_stop();
     unload_cover();
     audio_global_exit();
+    romfsExit();
 
     gspWaitForP3D();
     gspWaitForPPF();
